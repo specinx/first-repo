@@ -1,0 +1,179 @@
+def need(name)
+  ENV.fetch(name) { abort "Environment variable not set #{name}" }
+end
+
+DB_NAME  = need("DB_NAME")
+DB_USER  = need("DB_USER")
+DB_PASS  = need("DB_PASS")
+DB_PORT  = ENV.fetch("DB_PORT", "3306")
+APP_USER = ENV.fetch("APP_USER", "app_user")
+REPO_URL = need("REPO_URL")
+DB_HOST  = ENV.fetch("DB_HOST", "")
+
+
+Vagrant.configure("2") do |config|
+
+  config.vm.box = "generic/ubuntu2204"
+  config.vm.synced_folder ".", "/vagrant", disabled: true
+  config.vm.network "public_network", bridge: "EXSWITCH"
+
+  # OFF DNSSEC
+  config.vm.provision "shell", name: "dns", inline: <<-SHELL
+    mkdir -p /etc/systemd/resolved.conf.d
+    printf '%s\\n' '[Resolve]' 'DNS=' 'DNS=1.1.1.1 8.8.8.8' 'FallbackDNS=9.9.9.9' 'DNSSEC=no' > /etc/systemd/resolved.conf.d/lab.conf
+    systemctl restart systemd-resolved
+    for i in $(seq 1 10); do
+      getent hosts mirrors.edge.kernel.org && break
+      sleep 2
+    done
+  SHELL
+  
+  
+  #DB_VM
+  config.vm.define "db_vm" do |db|
+    db.vm.hostname = "db-vm"
+
+    db.vm.provider "hyperv" do |hv|
+      hv.vmname = "DB_VM"
+      hv.memory = 2048
+	  hv.maxmemory = 2048
+      hv.cpus   = 4
+	  hv.mac = "00155D010103"
+    end
+
+    db.vm.provision "shell", name: "mysql",
+      env: { "DB_NAME" => DB_NAME, "DB_USER" => DB_USER, "DB_PASS" => DB_PASS },
+      inline: <<-'SHELL'
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      apt-get update -y
+      apt-get install -y mysql-server python3
+
+      # Identify the subnet in which this VM is located (EXSWITCH)
+      CIDR=$(ip -4 -o addr show scope global | awk '{print $4}' | head -1)
+      read NET MASK < <(python3 - "$CIDR" <<'PY'
+import sys, ipaddress
+n = ipaddress.ip_interface(sys.argv[1]).network
+print(n.network_address, n.netmask)
+PY
+)
+      SUBNET_HOST="${NET}/${MASK}"
+      echo "Allowed subnet: $SUBNET_HOST"
+
+      # MySQL
+sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
+systemctl restart mysql
+
+      # DB 
+      mysql <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\`;
+CREATE USER IF NOT EXISTS '${DB_USER}'@'${SUBNET_HOST}' IDENTIFIED BY '${DB_PASS}';
+ALTER USER '${DB_USER}'@'${SUBNET_HOST}' IDENTIFIED BY '${DB_PASS}';
+GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'${SUBNET_HOST}';
+FLUSH PRIVILEGES;
+SQL
+    SHELL
+  end
+  
+  #APP_VM
+  config.vm.define "app_vm" do |app|
+    app.vm.hostname = "app-vm"
+
+    app.vm.provider "hyperv" do |hv|
+      hv.vmname = "APP_VM"
+      hv.memory = 4096
+	  hv.maxmemory = 4096
+      hv.cpus   = 12
+    end
+
+    app.vm.provision "shell", name: "app",
+      env: {
+        "APP_USER" => APP_USER, "REPO_URL" => REPO_URL, "DB_HOST" => DB_HOST,
+        "DB_PORT" => DB_PORT, "DB_NAME" => DB_NAME, "DB_USER" => DB_USER, "DB_PASS" => DB_PASS
+      },
+      inline: <<-'SHELL'
+      set -euo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      apt-get update -y
+      apt-get install -y git openjdk-17-jdk curl mysql-client-core-8.0
+
+      # Non-root user
+      id "$APP_USER" &>/dev/null || useradd -m -s /bin/bash "$APP_USER"
+      APP_DIR=$(getent passwd "$APP_USER" | cut -d: -f6)
+      PROJECT_DIR="$APP_DIR/project"
+
+      # IP DB_VM
+      if [ -z "${DB_HOST:-}" ]; then
+        for i in $(seq 1 30); do
+          DB_HOST=$(getent ahostsv4 db-vm.mshome.net | awk '{print $1; exit}') || true
+          [ -n "$DB_HOST" ] && break
+          sleep 2
+        done
+      fi
+      [ -n "${DB_HOST:-}" ] || { echo "Could not be determined IP DB_VM"; exit 1; }
+      echo "DB_HOST=$DB_HOST"
+
+      # Waiting for availability MySQL
+      for i in $(seq 1 30); do
+        (echo > /dev/tcp/$DB_HOST/$DB_PORT) 2>/dev/null && break
+        sleep 2
+      done
+
+      # Cloning a repository
+      if [ -d "$PROJECT_DIR/.git" ]; then
+        sudo -u "$APP_USER" git -C "$PROJECT_DIR" pull
+      else
+        sudo -u "$APP_USER" git clone "$REPO_URL" "$PROJECT_DIR"
+      fi
+
+      # Testing and build
+      sudo -u "$APP_USER" bash -c "cd '$PROJECT_DIR' && chmod +x mvnw && ./mvnw -B clean package"
+
+      # JAR to the APP_USER home directory
+      JAR=$(ls "$PROJECT_DIR"/target/*.jar | grep -v '\.original$' | head -1)
+      install -o "$APP_USER" -g "$APP_USER" -m 644 "$JAR" "$APP_DIR/app.jar"
+
+      # Environment variables for the application
+      cat > /etc/app.env <<EOF
+DB_HOST=$DB_HOST
+DB_PORT=$DB_PORT
+DB_NAME=$DB_NAME
+DB_USER=$DB_USER
+DB_PASS=$DB_PASS
+SPRING_PROFILES_ACTIVE=mysql
+MYSQL_URL=jdbc:mysql://$DB_HOST:$DB_PORT/$DB_NAME
+MYSQL_USER=$DB_USER
+MYSQL_PASS=$DB_PASS
+EOF
+      chown root:"$APP_USER" /etc/app.env
+      chmod 640 /etc/app.env
+
+      # Start java -jar as APP_USER via systemd
+      cat > /etc/systemd/system/petclinic.service <<EOF
+[Unit]
+Description=PetClinic
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=$APP_USER
+WorkingDirectory=$APP_DIR
+EnvironmentFile=/etc/app.env
+ExecStart=/usr/bin/java -jar $APP_DIR/app.jar
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      systemctl daemon-reload
+      systemctl enable --now petclinic
+
+      echo "Ready: http://$(hostname -I | awk '{print $1}'):8080"
+    SHELL
+  end
+
+
+
+end
